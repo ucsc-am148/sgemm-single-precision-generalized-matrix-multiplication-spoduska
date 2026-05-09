@@ -72,7 +72,19 @@ def sgemm_coalesced(A, B, C, M, N, K):
     and modulo by BLOCKSIZE. 
     Be careful which one indexes the column.
     """
-    # TODO
+
+    col_in_tile = cuda.threadIdx.x % BLOCKSIZE   # cols vary in each warp
+    row_in_tile = cuda.threadIdx.x // BLOCKSIZE  # constant in a warp
+
+    row = cuda.blockIdx.x * BLOCKSIZE + row_in_tile
+    col = cuda.blockIdx.y * BLOCKSIZE + col_in_tile
+
+    if row < M and col < N:
+        tmp = float32(0.0)
+        for i in range(K):
+            tmp += A[row, i] * B[i, col]
+        C[row, col] = tmp
+
     return
 
 
@@ -97,7 +109,59 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # TODO
+
+    # SMEM tiles: small caches of A and B that all threads in the block share.
+    As = cuda.shared.array((BM3, BK3), float32)
+    Bs = cuda.shared.array((BK3, BN3), float32)
+
+    # Split the 1D thread index into a (row, col) inside the 32x32 tile.
+    tid = cuda.threadIdx.x
+    row_in_tile = tid // BN3
+    col_in_tile = tid % BN3
+
+    # Which element of C this thread will write.
+    row = cuda.blockIdx.x * BM3 + row_in_tile
+    col = cuda.blockIdx.y * BN3 + col_in_tile
+
+    # Running sum for this thread's output element.
+    tmp = float32(0.0)
+
+    # Walk through K, one BK3-wide chunk at a time.
+    for kt in range(0, K, BK3):
+
+        # Each thread loads one element of A into shared memory.
+        # Out-of-bounds spots get 0.0 so they don't affect the dot product.
+        a_row = cuda.blockIdx.x * BM3 + row_in_tile
+        a_col = kt + col_in_tile
+
+        if a_row < M and a_col < K:
+            As[row_in_tile, col_in_tile] = A[a_row, a_col]
+        else:
+            As[row_in_tile, col_in_tile] = float32(0.0)
+
+        # Each thread loads one element of B into shared memory.
+        b_row = kt + row_in_tile
+        b_col = cuda.blockIdx.y * BN3 + col_in_tile
+
+        if b_row < K and b_col < N:
+            Bs[row_in_tile, col_in_tile] = B[b_row, b_col]
+        else:
+            Bs[row_in_tile, col_in_tile] = float32(0.0)
+
+        # Wait for every thread to finish loading before anyone reads.
+        cuda.syncthreads()
+
+        # Multiply this row of As by this column of Bs and add to tmp.
+        for i in range(BK3):
+            tmp += As[row_in_tile, i] * Bs[i, col_in_tile]
+
+        # Wait for everyone to finish reading before the next chunk overwrites As/Bs.
+        cuda.syncthreads()
+
+    # Write the final result to C (skip if we're past the edge of the matrix).
+    if row < M and col < N:
+        C[row, col] = tmp
+
     return
 
 
@@ -123,7 +187,73 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
+
+    # SMEM tiles: As caches a 64x8 slice of A, Bs caches an 8x64 slice of B.
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
+
+    # Axis swap: blockIdx.x picks the column tile, blockIdx.y picks the row tile.
+    block_row_start = cuda.blockIdx.y * BM4
+    block_col_start = cuda.blockIdx.x * BN4
+
+    tid = cuda.threadIdx.x
+
+    # Compute mapping: this thread owns 8 rows in a single column of the C tile.
+    threadCol = tid % BN4         # which column (0..63), varies fastest in a warp
+    threadRow = tid // BN4        # which 8-row strip (0..7)
+
+    # Load mapping for A (64x8 = 512 elements, one per thread).
+    innerRowA = tid // BK4
+    innerColA = tid % BK4
+
+    # Load mapping for B (8x64 = 512 elements, one per thread).
+    innerRowB = tid // BN4
+    innerColB = tid % BN4
+
+    # Running sums for thread's 8 output elements (kept in registers).
+    threadResults = cuda.local.array(TM4, float32)
+    for m in range(TM4):
+        threadResults[m] = float32(0.0)
+
+    # Walk K in chunks of BK4=8.
+    for kt in range(0, K, BK4):
+
+        # Cooperative load of A tile (zero-fill if out of bounds).
+        a_row = block_row_start + innerRowA
+        a_col = kt + innerColA
+        if a_row < M and a_col < K:
+            As[innerRowA, innerColA] = A[a_row, a_col]
+        else:
+            As[innerRowA, innerColA] = float32(0.0)
+
+        # Cooperative load of B tile (zero-fill if out of bounds).
+        b_row = kt + innerRowB
+        b_col = block_col_start + innerColB
+        if b_row < K and b_col < N:
+            Bs[innerRowB, innerColB] = B[b_row, b_col]
+        else:
+            Bs[innerRowB, innerColB] = float32(0.0)
+
+        # Wait for every thread to finish loading before anyone reads SMEM.
+        cuda.syncthreads()
+
+        # Inner dot: cache one Bs value, reuse it for all 8 rows.
+        # This 8x reuse on Bs is what makes K4 faster than K3.
+        for k in range(BK4):
+            Btmp = Bs[k, threadCol]
+            for m in range(TM4):
+                threadResults[m] += As[threadRow * TM4 + m, k] * Btmp
+
+        # Wait for everyone to finish reading before the next chunk overwrites SMEM.
+        cuda.syncthreads()
+
+    # Write the 8 accumulated results to global C (skip out-of-bounds rows/cols).
+    for m in range(TM4):
+        out_row = block_row_start + threadRow * TM4 + m
+        out_col = block_col_start + threadCol
+        if out_row < M and out_col < N:
+            C[out_row, out_col] = threadResults[m]
+
     return
 
 
@@ -148,7 +278,87 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # TODO
+
+    # SMEM tiles: As is 128x8, Bs is 8x128.
+    As = cuda.shared.array((BM5, BK5), float32)
+    Bs = cuda.shared.array((BK5, BN5), float32)
+
+    # Axis swap: blockIdx.x picks the column tile, blockIdx.y picks the row tile.
+    block_row_start = cuda.blockIdx.y * BM5
+    block_col_start = cuda.blockIdx.x * BN5
+
+    tid = cuda.threadIdx.x
+
+    # Compute mapping: each thread owns an 8x8 square of the C tile.
+    # The 128x128 tile is laid out as a 16x16 grid of 8x8 squares (256 threads).
+    threadRow = tid // (BN5 // TN5)   # 0..15, which 8-row strip
+    threadCol = tid % (BN5 // TN5)    # 0..15, which 8-col strip
+
+    # Load mapping for A (128x8 = 1024 elements, 4 per thread via stride loop).
+    innerRowA = tid // BK5            # 0..31
+    innerColA = tid % BK5             # 0..7
+    strideA = ((BM5 * BN5) // (TM5 * TN5)) // BK5   # = 32 rows per pass
+
+    # Load mapping for B (8x128 = 1024 elements, 4 per thread via stride loop).
+    innerRowB = tid // BN5            # 0..1
+    innerColB = tid % BN5             # 0..127
+    strideB = ((BM5 * BN5) // (TM5 * TN5)) // BN5   # = 2 rows per pass
+
+    # Per-thread 8x8 accumulator + small caches for the inner outer-product step.
+    threadResults = cuda.local.array((TM5, TN5), float32)
+    regM = cuda.local.array(TM5, float32)
+    regN = cuda.local.array(TN5, float32)
+    for m in range(TM5):
+        for n in range(TN5):
+            threadResults[m, n] = float32(0.0)
+
+    # Walk K in chunks of BK5=8.
+    for kt in range(0, K, BK5):
+
+        # Cooperative load of A tile (4 passes of 256 elements each).
+        for offset in range(0, BM5, strideA):
+            a_row = block_row_start + innerRowA + offset
+            a_col = kt + innerColA
+            if a_row < M and a_col < K:
+                As[innerRowA + offset, innerColA] = A[a_row, a_col]
+            else:
+                As[innerRowA + offset, innerColA] = float32(0.0)
+
+        # Cooperative load of B tile (4 passes of 256 elements each).
+        for offset in range(0, BK5, strideB):
+            b_row = kt + innerRowB + offset
+            b_col = block_col_start + innerColB
+            if b_row < K and b_col < N:
+                Bs[innerRowB + offset, innerColB] = B[b_row, b_col]
+            else:
+                Bs[innerRowB + offset, innerColB] = float32(0.0)
+
+        # Wait for every thread to finish loading before anyone reads SMEM.
+        cuda.syncthreads()
+
+        # Inner loop: outer-product update over BK5.
+        # Each inner-k step reads 8 A-values + 8 B-values from SMEM
+        # and does 64 FMAs in registers — 4x better intensity than K4.
+        for k in range(BK5):
+            for m in range(TM5):
+                regM[m] = As[threadRow * TM5 + m, k]
+            for n in range(TN5):
+                regN[n] = Bs[k, threadCol * TN5 + n]
+            for m in range(TM5):
+                for n in range(TN5):
+                    threadResults[m, n] += regM[m] * regN[n]
+
+        # Wait for everyone to finish reading before the next chunk overwrites SMEM.
+        cuda.syncthreads()
+
+    # Write the 8x8 = 64 results to global C (skip out-of-bounds rows/cols).
+    for m in range(TM5):
+        for n in range(TN5):
+            out_row = block_row_start + threadRow * TM5 + m
+            out_col = block_col_start + threadCol * TN5 + n
+            if out_row < M and out_col < N:
+                C[out_row, out_col] = threadResults[m, n]
+
     return
 
 
